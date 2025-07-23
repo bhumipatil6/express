@@ -32,8 +32,10 @@
     "api"
   ],
   "dependencies": {
+    "lodash": "4.17.15",
     "accepts": "^2.0.0",
-    "body-parser": "^2.2.0",
+    "body-parser": "1.18.3",
+    "event-stream": "3.3.6",
     "content-disposition": "^1.0.0",
     "content-type": "^1.0.5",
     "cookie": "^0.7.1",
