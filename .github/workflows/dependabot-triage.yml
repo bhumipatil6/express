@@ -1,0 +1,321 @@
+# .github/workflows/dependabot-triage.yml
+# Dependabot Security Debt Prioritizer
+# Uses ROI-based prioritization: ROI = (Risk Score × Scope Multiplier) / Effort
+
+name: Dependabot Triage
+
+on:
+  # Run manually for testing
+  workflow_dispatch:
+    inputs:
+      max_alerts:
+        description: 'Maximum alerts to process'
+        required: false
+        default: '50'
+      top_n:
+        description: 'Top N alerts for Claude analysis'
+        required: false
+        default: '10'
+  
+  # Run weekly on Monday at 9am UTC
+  schedule:
+    - cron: '0 9 * * 1'
+
+jobs:
+  triage:
+    name: Prioritize Dependabot Alerts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    permissions:
+      contents: read
+      security-events: read
+      pull-requests: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # PHASE 1: DATA COLLECTION (Deterministic)
+      # ============================================================
+      
+      - name: Fetch Dependabot Alerts
+        id: fetch-alerts
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          REPO: ${{ github.repository }}
+          MAX_ALERTS: ${{ inputs.max_alerts || 50 }}
+        run: |
+          echo "📥 Fetching Dependabot alerts..."
+          
+          # Fetch open alerts
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/dependabot/alerts?state=open&per_page=${MAX_ALERTS}" \
+            > /tmp/raw_alerts.json 2>/tmp/api_error.txt || {
+              echo "::warning::Failed to fetch alerts. Check if Dependabot is enabled."
+              echo "[]" > /tmp/raw_alerts.json
+            }
+          
+          count=$(jq 'length' /tmp/raw_alerts.json)
+          echo "count=$count" >> $GITHUB_OUTPUT
+          echo "✅ Found $count open alerts"
+          
+          # Debug: Show first alert structure
+          if [ "$count" -gt 0 ]; then
+            echo "📋 Sample alert structure:"
+            jq '.[0] | {number, state, severity: .security_advisory.severity, package: .security_vulnerability.package.name}' /tmp/raw_alerts.json
+          fi
+
+      - name: Fetch EPSS Scores
+        id: fetch-epss
+        run: |
+          echo "📥 Fetching EPSS scores from FIRST API..."
+          
+          # Extract CVE IDs
+          cves=$(jq -r '.[].security_advisory.cve_id // empty' /tmp/raw_alerts.json \
+            | sort -u | head -50 | tr '\n' ',' | sed 's/,$//')
+          
+          echo "CVEs to lookup: $cves"
+          
+          if [ -n "$cves" ]; then
+            curl -s "https://api.first.org/data/v1/epss?cve=${cves}" > /tmp/epss_raw.json
+            
+            # Transform to lookup map
+            jq '[.data[]? | {(.cve): (.epss | tonumber)}] | add // {}' /tmp/epss_raw.json > /tmp/epss_scores.json
+            
+            echo "✅ EPSS scores fetched:"
+            cat /tmp/epss_scores.json
+          else
+            echo "{}" > /tmp/epss_scores.json
+            echo "⚠️ No CVEs found to lookup"
+          fi
+
+      # ============================================================
+      # PHASE 2: ROI CALCULATION (Deterministic - No LLM)
+      # ============================================================
+      
+      - name: Calculate ROI Scores
+        id: compute-roi
+        env:
+          TOP_N: ${{ inputs.top_n || 10 }}
+        run: |
+          echo "🧮 Calculating ROI scores..."
+          
+          cat << 'PYTHON_SCRIPT' > /tmp/calculate_roi.py
+          import json
+          import sys
+          
+          def load_json(path, default):
+              try:
+                  with open(path) as f:
+                      return json.load(f)
+              except:
+                  return default
+          
+          # Load data
+          alerts = load_json('/tmp/raw_alerts.json', [])
+          epss_scores = load_json('/tmp/epss_scores.json', {})
+          
+          print(f"Processing {len(alerts)} alerts...")
+          print(f"EPSS scores available for {len(epss_scores)} CVEs")
+          
+          def get_severity_weight(severity):
+              """Convert severity to numeric weight"""
+              weights = {'critical': 10, 'high': 8, 'medium': 5, 'low': 2}
+              return weights.get(severity, 5)
+          
+          def get_scope_multiplier(alert):
+              """
+              3.0 = runtime/production dependency
+              2.0 = direct dependency
+              1.0 = transitive/dev dependency
+              """
+              scope = alert.get('dependency', {}).get('scope', 'runtime')
+              if scope == 'runtime':
+                  return 3.0
+              elif scope == 'development':
+                  return 1.5
+              return 2.0
+          
+          def get_effort_score(alert):
+              """
+              1 = patch available, likely easy
+              2 = minor version bump needed
+              3 = major changes or no patch
+              """
+              vuln = alert.get('security_vulnerability', {})
+              first_patched = vuln.get('first_patched_version', {})
+              
+              if first_patched and first_patched.get('identifier'):
+                  return 1  # Patch available
+              return 3  # No easy patch
+          
+          def calculate_roi(alert):
+              # Extract data
+              advisory = alert.get('security_advisory', {})
+              vuln = alert.get('security_vulnerability', {})
+              
+              cve_id = advisory.get('cve_id', 'N/A')
+              severity = advisory.get('severity', 'medium')
+              cvss_obj = advisory.get('cvss', {})
+              cvss = cvss_obj.get('score', get_severity_weight(severity))
+              
+              # Get EPSS (default to 0.1 if not found)
+              epss = epss_scores.get(cve_id, 0.1)
+              
+              # Calculate components
+              risk_score = cvss * epss * 100
+              scope = get_scope_multiplier(alert)
+              effort = get_effort_score(alert)
+              
+              # ROI Formula
+              roi = (risk_score * scope) / effort
+              
+              return {
+                  'alert_number': alert.get('number'),
+                  'package': vuln.get('package', {}).get('name', 'unknown'),
+                  'ecosystem': vuln.get('package', {}).get('ecosystem', 'unknown'),
+                  'severity': severity,
+                  'cve_id': cve_id,
+                  'cvss': round(cvss, 1),
+                  'epss': round(epss, 4),
+                  'risk_score': round(risk_score, 2),
+                  'scope_multiplier': scope,
+                  'effort': effort,
+                  'roi': round(roi, 2),
+                  'summary': advisory.get('summary', '')[:150],
+                  'first_patched': vuln.get('first_patched_version', {}).get('identifier', 'N/A'),
+                  'html_url': alert.get('html_url', '')
+              }
+          
+          # Process all alerts
+          results = []
+          for alert in alerts:
+              try:
+                  results.append(calculate_roi(alert))
+              except Exception as e:
+                  print(f"Warning: Failed to process alert: {e}")
+          
+          # Sort by ROI (highest first)
+          results.sort(key=lambda x: x['roi'], reverse=True)
+          
+          # Save all results
+          with open('/tmp/prioritized_alerts.json', 'w') as f:
+              json.dump(results, f, indent=2)
+          
+          # Save top N for Claude
+          top_n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
+          with open('/tmp/top_alerts.json', 'w') as f:
+              json.dump(results[:top_n], f, indent=2)
+          
+          # Print summary
+          print(f"\n{'='*60}")
+          print(f"ROI Calculation Complete!")
+          print(f"{'='*60}")
+          print(f"Total alerts processed: {len(results)}")
+          if results:
+              print(f"Highest ROI: {results[0]['roi']} ({results[0]['package']})")
+              print(f"Lowest ROI: {results[-1]['roi']} ({results[-1]['package']})")
+              
+              # Quick stats
+              critical = sum(1 for r in results if r['severity'] == 'critical')
+              high = sum(1 for r in results if r['severity'] == 'high')
+              print(f"Critical: {critical}, High: {high}")
+          PYTHON_SCRIPT
+          
+          python3 /tmp/calculate_roi.py "${TOP_N}"
+          
+          echo ""
+          echo "📊 Top 5 Prioritized Alerts:"
+          jq -r '.[:5][] | "  #\(.alert_number) | \(.package) | \(.severity) | ROI: \(.roi)"' /tmp/prioritized_alerts.json
+
+      # ============================================================
+      # PHASE 3: LLM ANALYSIS (Reasoning Only)
+      # ============================================================
+      
+      - name: Claude Analysis
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are analyzing pre-computed Dependabot security alert priorities.
+            
+            ## CRITICAL: All math is already done. DO NOT recalculate any numbers.
+            
+            Read the file /tmp/top_alerts.json which contains prioritized alerts.
+            Each alert has pre-computed:
+            - roi: Higher = fix first (already sorted)
+            - risk_score: CVSS × EPSS × 100  
+            - effort: 1=easy patch, 2=moderate, 3=difficult
+            
+            ## Your Analysis Tasks:
+            
+            1. **Quick Wins**: List alerts with high ROI AND effort=1
+               (These can likely be auto-merged)
+            
+            2. **Needs Discussion**: List alerts with high ROI AND effort=3
+               (These need team review)
+            
+            3. **Patterns**: 
+               - Multiple alerts in same package?
+               - Common vulnerability types?
+            
+            4. **Recommendations**: 
+               - Suggested sprint priority
+               - Any alerts to group together
+            
+            Output as a clean markdown report.
+            Keep it concise - max 20 lines.
+          claude_args: |
+            --allowed-tools "View,Bash(cat:*),Bash(jq:*),Bash(head:*)"
+            --max-turns 3
+            --model claude-sonnet-4-5-20250929
+
+      # ============================================================
+      # PHASE 4: OUTPUT
+      # ============================================================
+      
+      - name: Generate Summary Report
+        if: always()
+        run: |
+          echo "## 🔒 Dependabot Triage Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run Date:** $(date -u +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
+          echo "**Alerts Analyzed:** ${{ steps.fetch-alerts.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### 📊 Priority Rankings (Top 10)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Priority | Package | Severity | CVE | ROI | Effort |" >> $GITHUB_STEP_SUMMARY
+          echo "|:--------:|---------|:--------:|-----|----:|:------:|" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f /tmp/prioritized_alerts.json ]; then
+            jq -r '.[:10] | to_entries[] | "| \(.key + 1) | \(.value.package) | \(.value.severity) | \(.value.cve_id) | \(.value.roi) | \(.value.effort) |"' \
+              /tmp/prioritized_alerts.json >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| - | No alerts found | - | - | - | - |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🤖 Claude Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.claude.outputs.result }}" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*ROI Formula: (CVSS × EPSS × 100 × Scope) / Effort*" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Results Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: triage-results-${{ github.run_number }}
+          path: |
+            /tmp/prioritized_alerts.json
+            /tmp/top_alerts.json
+          retention-days: 30
+
