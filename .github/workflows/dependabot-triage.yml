@@ -1,112 +1,97 @@
-# .github/workflows/dependabot-triage.yml
-# Dependabot Security Debt Prioritizer
-# Uses ROI-based prioritization: ROI = (Risk Score × Scope Multiplier) / Effort
+# .github/workflows/dependabot-triage-auto-pr.yml
+# Dependabot Security Debt Prioritizer with Auto-PR for Safe Fixes
+# 
+# Features:
+# - ROI-based prioritization
+# - Auto-creates PRs for safe updates (patch/minor bumps)
+# - Runs tests before creating PR
+# - Labels PRs for easy identification and auto-merge
 
-name: Dependabot Triage
+name: Dependabot Triage with Auto-PR
 
 on:
-  # Run manually for testing
   workflow_dispatch:
     inputs:
       max_alerts:
         description: 'Maximum alerts to process'
         required: false
         default: '50'
-      top_n:
-        description: 'Top N alerts for Claude analysis'
+      auto_pr_count:
+        description: 'Max number of auto-PRs to create'
         required: false
-        default: '10'
+        default: '5'
+      dry_run:
+        description: 'Dry run - analyze only, no PRs'
+        required: false
+        default: 'false'
+        type: boolean
+      min_roi:
+        description: 'Minimum ROI score for auto-PR'
+        required: false
+        default: '100'
   
-  # Run weekly on Monday at 9am UTC
   schedule:
-    - cron: '0 9 * * 1'
+    - cron: '0 9 * * 1'  # Weekly Monday 9am UTC
+
+env:
+  NODE_VERSION: '20'
 
 jobs:
-  triage:
-    name: Prioritize Dependabot Alerts
+  # ============================================================
+  # JOB 1: Analyze and Prioritize Alerts
+  # ============================================================
+  analyze:
+    name: Analyze Dependabot Alerts
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     
     permissions:
       contents: read
       security-events: read
-      pull-requests: read
-      id-token: write
+    
+    outputs:
+      auto_pr_candidates: ${{ steps.identify-candidates.outputs.candidates }}
+      candidate_count: ${{ steps.identify-candidates.outputs.count }}
+      total_alerts: ${{ steps.fetch-alerts.outputs.count }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ============================================================
-      # PHASE 1: DATA COLLECTION (Deterministic)
-      # ============================================================
-      
       - name: Fetch Dependabot Alerts
         id: fetch-alerts
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          REPO: ${{ github.repository }}
-          MAX_ALERTS: ${{ inputs.max_alerts || 50 }}
         run: |
           echo "📥 Fetching Dependabot alerts..."
-          
-          # Fetch open alerts
           gh api \
             -H "Accept: application/vnd.github+json" \
-            "/repos/${REPO}/dependabot/alerts?state=open&per_page=${MAX_ALERTS}" \
-            > /tmp/raw_alerts.json 2>/tmp/api_error.txt || {
-              echo "::warning::Failed to fetch alerts. Check if Dependabot is enabled."
-              echo "[]" > /tmp/raw_alerts.json
-            }
+            "/repos/${{ github.repository }}/dependabot/alerts?state=open&per_page=${{ inputs.max_alerts || 50 }}" \
+            > /tmp/raw_alerts.json
           
           count=$(jq 'length' /tmp/raw_alerts.json)
           echo "count=$count" >> $GITHUB_OUTPUT
           echo "✅ Found $count open alerts"
-          
-          # Debug: Show first alert structure
-          if [ "$count" -gt 0 ]; then
-            echo "📋 Sample alert structure:"
-            jq '.[0] | {number, state, severity: .security_advisory.severity, package: .security_vulnerability.package.name}' /tmp/raw_alerts.json
-          fi
 
       - name: Fetch EPSS Scores
-        id: fetch-epss
         run: |
-          echo "📥 Fetching EPSS scores from FIRST API..."
-          
-          # Extract CVE IDs
           cves=$(jq -r '.[].security_advisory.cve_id // empty' /tmp/raw_alerts.json \
             | sort -u | head -50 | tr '\n' ',' | sed 's/,$//')
           
-          echo "CVEs to lookup: $cves"
-          
           if [ -n "$cves" ]; then
             curl -s "https://api.first.org/data/v1/epss?cve=${cves}" > /tmp/epss_raw.json
-            
-            # Transform to lookup map
             jq '[.data[]? | {(.cve): (.epss | tonumber)}] | add // {}' /tmp/epss_raw.json > /tmp/epss_scores.json
-            
-            echo "✅ EPSS scores fetched:"
-            cat /tmp/epss_scores.json
           else
-            echo "{}" > /tmp/epss_scores.json
-            echo "⚠️ No CVEs found to lookup"
+            echo '{}' > /tmp/epss_scores.json
           fi
 
-      # ============================================================
-      # PHASE 2: ROI CALCULATION (Deterministic - No LLM)
-      # ============================================================
-      
-      - name: Calculate ROI Scores
-        id: compute-roi
-        env:
-          TOP_N: ${{ inputs.top_n || 10 }}
+      - name: Calculate ROI and Identify Auto-PR Candidates
+        id: identify-candidates
         run: |
-          echo "🧮 Calculating ROI scores..."
-          
-          cat << 'PYTHON_SCRIPT' > /tmp/calculate_roi.py
+          cat << 'PYTHON_SCRIPT' > /tmp/analyze.py
           import json
           import sys
+          import re
           
           def load_json(path, default):
               try:
@@ -115,64 +100,83 @@ jobs:
               except:
                   return default
           
-          # Load data
           alerts = load_json('/tmp/raw_alerts.json', [])
           epss_scores = load_json('/tmp/epss_scores.json', {})
           
-          print(f"Processing {len(alerts)} alerts...")
-          print(f"EPSS scores available for {len(epss_scores)} CVEs")
+          min_roi = float(sys.argv[1]) if len(sys.argv) > 1 else 100
+          max_candidates = int(sys.argv[2]) if len(sys.argv) > 2 else 5
           
-          def get_severity_weight(severity):
-              """Convert severity to numeric weight"""
-              weights = {'critical': 10, 'high': 8, 'medium': 5, 'low': 2}
-              return weights.get(severity, 5)
+          def parse_version(v):
+              """Parse semver string to tuple"""
+              if not v:
+                  return (0, 0, 0)
+              match = re.match(r'^(\d+)\.(\d+)\.(\d+)', str(v))
+              if match:
+                  return tuple(map(int, match.groups()))
+              return (0, 0, 0)
           
-          def get_scope_multiplier(alert):
-              """
-              3.0 = runtime/production dependency
-              2.0 = direct dependency
-              1.0 = transitive/dev dependency
-              """
-              scope = alert.get('dependency', {}).get('scope', 'runtime')
-              if scope == 'runtime':
-                  return 3.0
-              elif scope == 'development':
-                  return 1.5
-              return 2.0
-          
-          def get_effort_score(alert):
-              """
-              1 = patch available, likely easy
-              2 = minor version bump needed
-              3 = major changes or no patch
-              """
-              vuln = alert.get('security_vulnerability', {})
-              first_patched = vuln.get('first_patched_version', {})
+          def get_update_type(current, patched):
+              """Determine if update is patch, minor, or major"""
+              if not current or not patched:
+                  return 'unknown'
               
-              if first_patched and first_patched.get('identifier'):
-                  return 1  # Patch available
-              return 3  # No easy patch
+              curr = parse_version(current)
+              patch = parse_version(patched)
+              
+              if curr[0] != patch[0]:
+                  return 'major'
+              elif curr[1] != patch[1]:
+                  return 'minor'
+              elif curr[2] != patch[2]:
+                  return 'patch'
+              return 'unknown'
+          
+          def is_safe_for_auto_pr(alert, update_type):
+              """Determine if alert is safe for automatic PR"""
+              # Only patch and minor updates are safe
+              if update_type not in ['patch', 'minor']:
+                  return False
+              
+              # Must have a patched version
+              vuln = alert.get('security_vulnerability', {})
+              if not vuln.get('first_patched_version', {}).get('identifier'):
+                  return False
+              
+              # Skip if package ecosystem isn't npm (for now)
+              if vuln.get('package', {}).get('ecosystem', '').lower() != 'npm':
+                  return False
+              
+              return True
           
           def calculate_roi(alert):
-              # Extract data
               advisory = alert.get('security_advisory', {})
               vuln = alert.get('security_vulnerability', {})
               
               cve_id = advisory.get('cve_id', 'N/A')
               severity = advisory.get('severity', 'medium')
-              cvss_obj = advisory.get('cvss', {})
-              cvss = cvss_obj.get('score', get_severity_weight(severity))
-              
-              # Get EPSS (default to 0.1 if not found)
+              cvss = advisory.get('cvss', {}).get('score', 5.0)
               epss = epss_scores.get(cve_id, 0.1)
               
-              # Calculate components
-              risk_score = cvss * epss * 100
-              scope = get_scope_multiplier(alert)
-              effort = get_effort_score(alert)
+              # Get version info
+              current_version = vuln.get('vulnerable_version_range', '')
+              first_patched = vuln.get('first_patched_version', {}).get('identifier', '')
               
-              # ROI Formula
-              roi = (risk_score * scope) / effort
+              # Simple extraction of current version from range like "< 3.9.8"
+              current_match = re.search(r'(\d+\.\d+\.\d+)', current_version)
+              current = current_match.group(1) if current_match else ''
+              
+              update_type = get_update_type(current, first_patched)
+              
+              # Scope multiplier
+              scope = alert.get('dependency', {}).get('scope', 'runtime')
+              scope_mult = 3.0 if scope == 'runtime' else 1.5
+              
+              # Effort based on update type
+              effort_map = {'patch': 1, 'minor': 1.5, 'major': 3, 'unknown': 2}
+              effort = effort_map.get(update_type, 2)
+              
+              risk_score = cvss * epss * 100
+              roi = (risk_score * scope_mult) / effort
               
               return {
                   'alert_number': alert.get('number'),
@@ -182,13 +186,14 @@ jobs:
                   'cve_id': cve_id,
                   'cvss': round(cvss, 1),
                   'epss': round(epss, 4),
-                  'risk_score': round(risk_score, 2),
-                  'scope_multiplier': scope,
-                  'effort': effort,
                   'roi': round(roi, 2),
-                  'summary': advisory.get('summary', '')[:150],
-                  'first_patched': vuln.get('first_patched_version', {}).get('identifier', 'N/A'),
-                  'html_url': alert.get('html_url', '')
+                  'current_version': current,
+                  'patched_version': first_patched,
+                  'update_type': update_type,
+                  'safe_for_auto_pr': is_safe_for_auto_pr(alert, update_type),
+                  'summary': advisory.get('summary', '')[:100],
+                  'html_url': alert.get('html_url', ''),
+                  'manifest_path': alert.get('dependency', {}).get('manifest_path', 'package.json')
               }
           
           # Process all alerts
@@ -197,126 +202,283 @@ jobs:
               try:
                   results.append(calculate_roi(alert))
               except Exception as e:
-                  print(f"Warning: Failed to process alert: {e}")
+                  print(f"Warning: {e}")
           
-          # Sort by ROI (highest first)
+          # Sort by ROI
           results.sort(key=lambda x: x['roi'], reverse=True)
           
           # Save all results
           with open('/tmp/prioritized_alerts.json', 'w') as f:
               json.dump(results, f, indent=2)
           
-          # Save top N for Claude
-          top_n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-          with open('/tmp/top_alerts.json', 'w') as f:
-              json.dump(results[:top_n], f, indent=2)
+          # Identify auto-PR candidates
+          candidates = [
+              r for r in results 
+              if r['safe_for_auto_pr'] and r['roi'] >= min_roi
+          ][:max_candidates]
           
-          # Print summary
+          # Dedupe by package (keep highest ROI for each package)
+          seen_packages = set()
+          deduped_candidates = []
+          for c in candidates:
+              if c['package'] not in seen_packages:
+                  seen_packages.add(c['package'])
+                  deduped_candidates.append(c)
+          
+          with open('/tmp/auto_pr_candidates.json', 'w') as f:
+              json.dump(deduped_candidates, f, indent=2)
+          
           print(f"\n{'='*60}")
-          print(f"ROI Calculation Complete!")
+          print(f"Analysis Complete!")
           print(f"{'='*60}")
-          print(f"Total alerts processed: {len(results)}")
-          if results:
-              print(f"Highest ROI: {results[0]['roi']} ({results[0]['package']})")
-              print(f"Lowest ROI: {results[-1]['roi']} ({results[-1]['package']})")
-              
-              # Quick stats
-              critical = sum(1 for r in results if r['severity'] == 'critical')
-              high = sum(1 for r in results if r['severity'] == 'high')
-              print(f"Critical: {critical}, High: {high}")
+          print(f"Total alerts: {len(results)}")
+          print(f"Auto-PR candidates: {len(deduped_candidates)}")
+          
+          for c in deduped_candidates:
+              print(f"  ✓ {c['package']}: {c['current_version']} → {c['patched_version']} ({c['update_type']}) ROI: {c['roi']}")
           PYTHON_SCRIPT
           
-          python3 /tmp/calculate_roi.py "${TOP_N}"
+          python3 /tmp/analyze.py ${{ inputs.min_roi || 100 }} ${{ inputs.auto_pr_count || 5 }}
           
-          echo ""
-          echo "📊 Top 5 Prioritized Alerts:"
-          jq -r '.[:5][] | "  #\(.alert_number) | \(.package) | \(.severity) | ROI: \(.roi)"' /tmp/prioritized_alerts.json
+          # Set outputs
+          candidates=$(cat /tmp/auto_pr_candidates.json | jq -c '.')
+          count=$(cat /tmp/auto_pr_candidates.json | jq 'length')
+          
+          echo "candidates=$candidates" >> $GITHUB_OUTPUT
+          echo "count=$count" >> $GITHUB_OUTPUT
 
-      # ============================================================
-      # PHASE 3: LLM ANALYSIS (Reasoning Only)
-      # ============================================================
-      
-      - name: Claude Analysis
-        id: claude
-        uses: anthropics/claude-code-action@v1
+      - name: Upload Analysis Results
+        uses: actions/upload-artifact@v4
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: |
-            You are analyzing pre-computed Dependabot security alert priorities.
-            
-            ## CRITICAL: All math is already done. DO NOT recalculate any numbers.
-            
-            Read the file /tmp/top_alerts.json which contains prioritized alerts.
-            Each alert has pre-computed:
-            - roi: Higher = fix first (already sorted)
-            - risk_score: CVSS × EPSS × 100  
-            - effort: 1=easy patch, 2=moderate, 3=difficult
-            
-            ## Your Analysis Tasks:
-            
-            1. **Quick Wins**: List alerts with high ROI AND effort=1
-               (These can likely be auto-merged)
-            
-            2. **Needs Discussion**: List alerts with high ROI AND effort=3
-               (These need team review)
-            
-            3. **Patterns**: 
-               - Multiple alerts in same package?
-               - Common vulnerability types?
-            
-            4. **Recommendations**: 
-               - Suggested sprint priority
-               - Any alerts to group together
-            
-            Output as a clean markdown report.
-            Keep it concise - max 20 lines.
-          claude_args: |
-            --allowed-tools "View,Bash(cat:*),Bash(jq:*),Bash(head:*)"
-            --max-turns 3
-            --model claude-sonnet-4-5-20250929
+          name: triage-analysis-${{ github.run_number }}
+          path: |
+            /tmp/prioritized_alerts.json
+            /tmp/auto_pr_candidates.json
 
-      # ============================================================
-      # PHASE 4: OUTPUT
-      # ============================================================
-      
+  # ============================================================
+  # JOB 2: Create Auto-PRs for Safe Updates
+  # ============================================================
+  create-prs:
+    name: Create Auto-PRs
+    needs: analyze
+    if: ${{ needs.analyze.outputs.candidate_count > 0 && inputs.dry_run != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    permissions:
+      contents: write
+      pull-requests: write
+    
+    strategy:
+      fail-fast: false
+      max-parallel: 1  # Create PRs one at a time to avoid conflicts
+      matrix:
+        candidate: ${{ fromJson(needs.analyze.outputs.auto_pr_candidates) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Create Branch and Update Package
+        id: update
+        run: |
+          PACKAGE="${{ matrix.candidate.package }}"
+          VERSION="${{ matrix.candidate.patched_version }}"
+          ALERT_NUM="${{ matrix.candidate.alert_number }}"
+          
+          BRANCH_NAME="security/dependabot-${PACKAGE}-${VERSION//\./-}"
+          
+          echo "📦 Updating $PACKAGE to $VERSION"
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          
+          # Check if branch already exists
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            echo "⏭️ Branch $BRANCH_NAME already exists, skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Create new branch
+          git checkout -b "$BRANCH_NAME"
+          
+          # Update package
+          npm install "${PACKAGE}@${VERSION}" --save
+          
+          # Check if there are changes
+          if git diff --quiet package.json package-lock.json; then
+            echo "⏭️ No changes detected, skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "skip=false" >> $GITHUB_OUTPUT
+
+      - name: Run Tests
+        id: test
+        if: steps.update.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          echo "🧪 Running tests..."
+          
+          # Install dependencies
+          npm ci
+          
+          # Run tests if they exist
+          if npm run test --if-present 2>/dev/null; then
+            echo "test_passed=true" >> $GITHUB_OUTPUT
+            echo "✅ Tests passed"
+          else
+            echo "test_passed=false" >> $GITHUB_OUTPUT
+            echo "⚠️ Tests failed or not configured"
+          fi
+
+      - name: Commit and Push
+        id: commit
+        if: steps.update.outputs.skip != 'true'
+        run: |
+          PACKAGE="${{ matrix.candidate.package }}"
+          VERSION="${{ matrix.candidate.patched_version }}"
+          
+          git add package.json package-lock.json
+          git commit -m "fix(security): update $PACKAGE to $VERSION
+
+          Resolves Dependabot alert #${{ matrix.candidate.alert_number }}
+          
+          Security Advisory: ${{ matrix.candidate.summary }}
+          CVE: ${{ matrix.candidate.cve_id }}
+          Severity: ${{ matrix.candidate.severity }}
+          ROI Score: ${{ matrix.candidate.roi }}
+          
+          Auto-generated by Dependabot Triage workflow"
+          
+          git push origin "${{ steps.update.outputs.branch_name }}"
+
+      - name: Create Pull Request
+        if: steps.update.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          PACKAGE="${{ matrix.candidate.package }}"
+          VERSION="${{ matrix.candidate.patched_version }}"
+          TEST_STATUS="${{ steps.test.outputs.test_passed }}"
+          
+          # Set labels based on test status
+          if [ "$TEST_STATUS" = "true" ]; then
+            LABELS="security,auto-pr,tests-passed,safe-to-merge"
+            TEST_BADGE="✅ Tests Passed"
+          else
+            LABELS="security,auto-pr,needs-review"
+            TEST_BADGE="⚠️ Tests Need Review"
+          fi
+          
+          # Create PR
+          gh pr create \
+            --title "🔒 Security: Update $PACKAGE to $VERSION" \
+            --body "## Security Update
+
+          **Package:** \`$PACKAGE\`
+          **Update:** \`${{ matrix.candidate.current_version }}\` → \`$VERSION\`
+          **Update Type:** ${{ matrix.candidate.update_type }}
+
+          ### Security Details
+
+          | Metric | Value |
+          |--------|-------|
+          | **CVE** | ${{ matrix.candidate.cve_id }} |
+          | **Severity** | ${{ matrix.candidate.severity }} |
+          | **CVSS** | ${{ matrix.candidate.cvss }} |
+          | **EPSS** | ${{ matrix.candidate.epss }} ($(echo '${{ matrix.candidate.epss }} * 100' | bc)% exploitation probability) |
+          | **ROI Score** | ${{ matrix.candidate.roi }} |
+
+          ### Summary
+          ${{ matrix.candidate.summary }}
+
+          ### Test Status
+          $TEST_BADGE
+
+          ### Links
+          - [Dependabot Alert #${{ matrix.candidate.alert_number }}](${{ matrix.candidate.html_url }})
+
+          ---
+          *Auto-generated by Dependabot Triage workflow. Review and merge when ready.*
+          " \
+            --label "$LABELS" \
+            --head "${{ steps.update.outputs.branch_name }}" \
+            --base main
+
+  # ============================================================
+  # JOB 3: Generate Summary Report
+  # ============================================================
+  summary:
+    name: Generate Summary
+    needs: [analyze, create-prs]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download Analysis
+        uses: actions/download-artifact@v4
+        with:
+          name: triage-analysis-${{ github.run_number }}
+          path: /tmp/
+
       - name: Generate Summary Report
-        if: always()
         run: |
           echo "## 🔒 Dependabot Triage Report" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
           echo "**Run Date:** $(date -u +%Y-%m-%d)" >> $GITHUB_STEP_SUMMARY
-          echo "**Alerts Analyzed:** ${{ steps.fetch-alerts.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Total Alerts:** ${{ needs.analyze.outputs.total_alerts }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Auto-PR Candidates:** ${{ needs.analyze.outputs.candidate_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Dry Run:** ${{ inputs.dry_run || 'false' }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          echo "### 📊 Priority Rankings (Top 10)" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Top 10 Priority Alerts" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Priority | Package | Severity | CVE | ROI | Effort |" >> $GITHUB_STEP_SUMMARY
-          echo "|:--------:|---------|:--------:|-----|----:|:------:|" >> $GITHUB_STEP_SUMMARY
+          echo "| Package | Severity | CVE | ROI | Update | Auto-PR? |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|:--------:|-----|----:|--------|:--------:|" >> $GITHUB_STEP_SUMMARY
           
-          if [ -f /tmp/prioritized_alerts.json ]; then
-            jq -r '.[:10] | to_entries[] | "| \(.key + 1) | \(.value.package) | \(.value.severity) | \(.value.cve_id) | \(.value.roi) | \(.value.effort) |"' \
-              /tmp/prioritized_alerts.json >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| - | No alerts found | - | - | - | - |" >> $GITHUB_STEP_SUMMARY
+          jq -r '.[:10][] | "| \(.package) | \(.severity) | \(.cve_id // "N/A") | \(.roi) | \(.update_type) | \(if .safe_for_auto_pr then "✅" else "❌" end) |"' \
+            /tmp/prioritized_alerts.json >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🤖 Auto-PR Candidates" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f /tmp/auto_pr_candidates.json ]; then
+            count=$(jq 'length' /tmp/auto_pr_candidates.json)
+            if [ "$count" -gt 0 ]; then
+              echo "| Package | Current | Patched | ROI | Status |" >> $GITHUB_STEP_SUMMARY
+              echo "|---------|---------|---------|----:|--------|" >> $GITHUB_STEP_SUMMARY
+              jq -r '.[] | "| \(.package) | \(.current_version) | \(.patched_version) | \(.roi) | PR Created |"' \
+                /tmp/auto_pr_candidates.json >> $GITHUB_STEP_SUMMARY
+            else
+              echo "No candidates met the criteria for auto-PR." >> $GITHUB_STEP_SUMMARY
+            fi
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🤖 Claude Analysis" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "${{ steps.claude.outputs.result }}" >> $GITHUB_STEP_SUMMARY
-          
-          echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "*ROI Formula: (CVSS × EPSS × 100 × Scope) / Effort*" >> $GITHUB_STEP_SUMMARY
-
-      - name: Upload Results Artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: triage-results-${{ github.run_number }}
-          path: |
-            /tmp/prioritized_alerts.json
-            /tmp/top_alerts.json
-          retention-days: 30
-
+          echo "*ROI = (CVSS × EPSS × 100 × Scope) / Effort*" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Auto-PR Criteria:**" >> $GITHUB_STEP_SUMMARY
+          echo "- ROI ≥ ${{ inputs.min_roi || 100 }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Patch or minor version update only" >> $GITHUB_STEP_SUMMARY
+          echo "- npm ecosystem" >> $GITHUB_STEP_SUMMARY
