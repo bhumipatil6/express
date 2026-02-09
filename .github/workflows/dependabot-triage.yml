@@ -315,16 +315,34 @@ jobs:
           # Create new branch
           git checkout -b "$BRANCH_NAME"
           
-          # Update package - use --legacy-peer-deps first to handle conflicts
-          echo "📥 Installing ${PACKAGE}@${VERSION}..."
-          if npm install "${PACKAGE}@${VERSION}" --save --legacy-peer-deps; then
-            echo "✅ Package installed with --legacy-peer-deps"
-          elif npm install "${PACKAGE}@${VERSION}" --save --force; then
-            echo "✅ Package installed with --force"
+          # Method 1: Direct package.json update (faster, avoids dependency resolution)
+          echo "📝 Updating package.json directly..."
+          if command -v jq &> /dev/null; then
+            # Update in dependencies
+            if jq -e ".dependencies[\"$PACKAGE\"]" package.json > /dev/null 2>&1; then
+              jq ".dependencies[\"$PACKAGE\"] = \"$VERSION\"" package.json > package.json.tmp && mv package.json.tmp package.json
+              echo "✅ Updated $PACKAGE in dependencies"
+            # Update in devDependencies
+            elif jq -e ".devDependencies[\"$PACKAGE\"]" package.json > /dev/null 2>&1; then
+              jq ".devDependencies[\"$PACKAGE\"] = \"$VERSION\"" package.json > package.json.tmp && mv package.json.tmp package.json
+              echo "✅ Updated $PACKAGE in devDependencies"
+            else
+              echo "⚠️ Package $PACKAGE not found in package.json, trying npm install..."
+              # Fallback to npm install
+              if npm install "${PACKAGE}@${VERSION}" --save --legacy-peer-deps --ignore-scripts; then
+                echo "✅ Package installed with npm"
+              elif npm install "${PACKAGE}@${VERSION}" --save --force --ignore-scripts; then
+                echo "✅ Package installed with --force"
+              else
+                echo "❌ Failed to install package"
+                echo "skip=true" >> $GITHUB_OUTPUT
+                exit 0
+              fi
+            fi
           else
-            echo "❌ Failed to install package"
-            echo "skip=true" >> $GITHUB_OUTPUT
-            exit 0
+            # No jq, use sed (less reliable but works)
+            sed -i "s/\"$PACKAGE\": \"[^\"]*\"/\"$PACKAGE\": \"$VERSION\"/" package.json
+            echo "✅ Updated with sed"
           fi
           
           # Check if there are changes
@@ -335,24 +353,43 @@ jobs:
           fi
           
           echo "skip=false" >> $GITHUB_OUTPUT
+          
+          # Show the change
+          echo "📋 Change made:"
+          git diff package.json | head -20
 
       - name: Run Tests
         id: test
         if: steps.update.outputs.skip != 'true'
         continue-on-error: true
         run: |
-          echo "🧪 Running tests..."
+          echo "🧪 Checking if tests can run..."
           
-          # Install dependencies (use install, not ci - no lock file)
-          npm install --legacy-peer-deps 2>/dev/null || npm install
-          
-          # Run tests if they exist
-          if npm run test --if-present 2>/dev/null; then
-            echo "test_passed=true" >> $GITHUB_OUTPUT
-            echo "✅ Tests passed"
-          else
+          # Check if test script exists
+          if ! jq -e '.scripts.test' package.json > /dev/null 2>&1; then
+            echo "⚠️ No test script defined, marking as needs-review"
             echo "test_passed=false" >> $GITHUB_OUTPUT
-            echo "⚠️ Tests failed or not configured"
+            echo "test_skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Try to install and test (but don't fail the job if it doesn't work)
+          echo "📥 Installing dependencies..."
+          if npm install --legacy-peer-deps --ignore-scripts 2>/dev/null; then
+            echo "✅ Dependencies installed"
+            
+            echo "🧪 Running tests..."
+            if npm test 2>/dev/null; then
+              echo "test_passed=true" >> $GITHUB_OUTPUT
+              echo "✅ Tests passed"
+            else
+              echo "test_passed=false" >> $GITHUB_OUTPUT
+              echo "⚠️ Tests failed"
+            fi
+          else
+            echo "⚠️ Could not install dependencies for testing"
+            echo "test_passed=false" >> $GITHUB_OUTPUT
+            echo "test_skipped=true" >> $GITHUB_OUTPUT
           fi
 
       - name: Commit and Push
