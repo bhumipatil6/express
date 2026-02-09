@@ -286,7 +286,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
+          # Note: cache disabled - no lock file in repo
 
       - name: Configure Git
         run: |
@@ -315,11 +315,12 @@ jobs:
           # Create new branch
           git checkout -b "$BRANCH_NAME"
           
-          # Update package
+          # Update package (handle peer dependency issues)
+          npm install "${PACKAGE}@${VERSION}" --save --legacy-peer-deps 2>/dev/null || \
           npm install "${PACKAGE}@${VERSION}" --save
           
           # Check if there are changes
-          if git diff --quiet package.json package-lock.json; then
+          if git diff --quiet package.json; then
             echo "⏭️ No changes detected, skipping"
             echo "skip=true" >> $GITHUB_OUTPUT
             exit 0
@@ -334,8 +335,8 @@ jobs:
         run: |
           echo "🧪 Running tests..."
           
-          # Install dependencies
-          npm ci
+          # Install dependencies (use install, not ci - no lock file)
+          npm install --legacy-peer-deps 2>/dev/null || npm install
           
           # Run tests if they exist
           if npm run test --if-present 2>/dev/null; then
@@ -353,7 +354,14 @@ jobs:
           PACKAGE="${{ matrix.candidate.package }}"
           VERSION="${{ matrix.candidate.patched_version }}"
           
-          git add package.json package-lock.json
+          # Add package.json (always exists)
+          git add package.json
+          
+          # Add lock file if it exists
+          if [ -f package-lock.json ]; then
+            git add package-lock.json
+          fi
+          
           git commit -m "fix(security): update $PACKAGE to $VERSION
 
           Resolves Dependabot alert #${{ matrix.candidate.alert_number }}
