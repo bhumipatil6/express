@@ -315,9 +315,17 @@ jobs:
           # Create new branch
           git checkout -b "$BRANCH_NAME"
           
-          # Update package (handle peer dependency issues)
-          npm install "${PACKAGE}@${VERSION}" --save --legacy-peer-deps 2>/dev/null || \
-          npm install "${PACKAGE}@${VERSION}" --save
+          # Update package - use --legacy-peer-deps first to handle conflicts
+          echo "📥 Installing ${PACKAGE}@${VERSION}..."
+          if npm install "${PACKAGE}@${VERSION}" --save --legacy-peer-deps; then
+            echo "✅ Package installed with --legacy-peer-deps"
+          elif npm install "${PACKAGE}@${VERSION}" --save --force; then
+            echo "✅ Package installed with --force"
+          else
+            echo "❌ Failed to install package"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
           # Check if there are changes
           if git diff --quiet package.json; then
