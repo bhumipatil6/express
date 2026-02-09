@@ -78,7 +78,7 @@
     "pg": "7.4.3",
     "mysql2": "1.6.5",
     "redis": "2.8.0",
-    "vm2": "3.9.10",
+    "vm2": "3.10.0",
     "systeminformation": "5.11.0",
     "pac-resolver": "5.0.0",
     "node-ipc": "9.2.1",
